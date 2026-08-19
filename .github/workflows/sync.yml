@@ -1,0 +1,32 @@
+name: Auto-Update IPO Data
+
+on:
+  schedule:
+    - cron: '0 */2 * * *' # Runs automatically every 2 hours
+  workflow_dispatch: # Allows you to trigger it manually
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Run Scraper Engine
+        run: node scraper.js
+
+      - name: Save JSON to Repository
+        run: |
+          git config --global user.name "PocketMint Auto-Bot"
+          git config --global user.email "bot@pocketmint.com"
+          git add ipo-data.json
+          git commit -m "Auto-updated IPO data" || echo "No changes to commit"
+          git push
