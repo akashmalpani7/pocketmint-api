@@ -4,43 +4,97 @@ const UPSTOX_API = "https://service.upstox.com/nextgen-ipo/open/v1";
 const UPSTOX_CONTENT = "https://service.upstox.com/content/open/v2";
 const IPOWATCH_URL = "https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/";
 
+// Helper to pause between requests so we don't trigger rate limits
+const delay = ms => new Promise(res => setTimeout(res, ms));
+
+async function stealthFetchJson(targetUrl) {
+    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+    const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Origin': 'https://upstox.com',
+        'Referer': 'https://upstox.com/'
+    };
+
+    try {
+        // Try direct first with stealth headers
+        let res = await fetch(targetUrl, { headers });
+        if (res.ok) return await res.json();
+        
+        // If blocked, use the proxy
+        res = await fetch(proxyUrl, { headers });
+        if (res.ok) return await res.json();
+    } catch (e) {
+        console.log(`Failed to fetch JSON: ${targetUrl}`);
+    }
+    return null;
+}
+
+async function stealthFetchHtml(targetUrl) {
+    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+    const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+    
+    try {
+        let res = await fetch(targetUrl, { headers });
+        if (res.ok) return await res.text();
+        
+        res = await fetch(proxyUrl, { headers });
+        if (res.ok) return await res.text();
+    } catch (e) {}
+    return "";
+}
+
 async function runScraper() {
-    console.log("Starting Scraper Engine...");
+    console.log("Starting Enterprise Stealth Scraper Engine...");
     const statuses = ["open", "upcoming", "closed", "listed"];
     let rawList = [];
 
-    // 1. Fetch Upstox Discovery (Azure IPs bypass Cloudflare blocks)
+    // 1. Fetch Upstox Discovery via Proxies
     for (const status of statuses) {
-        try {
-            const res = await fetch(`${UPSTOX_API}/ipos?status=${status}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-            const json = await res.json();
-            if (json && json.data) {
-                rawList.push(...json.data.map(i => ({ ...i, _lifecycle: status.toUpperCase() })));
-            }
-        } catch(e) { console.log(`Failed status: ${status}`); }
+        console.log(`Discovering [${status.toUpperCase()}] IPOs...`);
+        const json = await stealthFetchJson(`${UPSTOX_API}/ipos?status=${status}`);
+        if (json && json.data) {
+            rawList.push(...json.data.map(i => ({ ...i, _lifecycle: status.toUpperCase() })));
+        }
+        await delay(500); // Polite 0.5s wait
     }
 
-    // 2. Fetch IPOWatch GMP
-    let gmpIndex = [];
-    try {
-        const res = await fetch(IPOWATCH_URL, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        const html = await res.text();
-        gmpIndex = parseIpoWatchHtml(html);
-    } catch(e) { console.log("Failed GMP fetch"); }
+    if (rawList.length === 0) {
+        console.error("CRITICAL ERROR: Proxies were blocked. Zero records fetched.");
+        return;
+    }
 
-    // 3. Process and Merge Deep Details
+    // Deduplicate
+    const uniqueMap = new Map();
+    rawList.forEach(item => {
+        if (item.slug && !uniqueMap.has(item.slug)) uniqueMap.set(item.slug, item);
+    });
+    const uniqueList = Array.from(uniqueMap.values());
+    console.log(`Discovered ${uniqueList.length} unique IPOs.`);
+
+    // 2. Fetch IPOWatch GMP
+    console.log("Fetching GMP sentiment from IPOWatch...");
+    let gmpIndex = [];
+    const html = await stealthFetchHtml(IPOWATCH_URL);
+    if (html) gmpIndex = parseIpoWatchHtml(html);
+
+    // 3. Process and Merge Deep Details (Safely throttled)
     const finalRecords = [];
-    for (const item of rawList) {
+    let count = 0;
+
+    for (const item of uniqueList) {
+        count++;
         let content = null;
         const status = item._lifecycle === "OPEN" ? "LIVE" : item._lifecycle;
 
-        // Fetch deep details (Dates, DRHP) for Active IPOs
+        // Fetch deep details (Dates, DRHP) for Active & Upcoming IPOs
         if (status === "LIVE" || status === "UPCOMING") {
-            try {
-                const cRes = await fetch(`${UPSTOX_CONTENT}/ipo/slug/${item.slug}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-                const cJson = await cRes.json();
-                if (cJson && cJson.data) content = cJson.data;
-            } catch(e) {}
+            console.log(`[${count}/${uniqueList.length}] Fetching deep data for: ${item.slug}`);
+            const cJson = await stealthFetchJson(`${UPSTOX_CONTENT}/ipo/slug/${item.slug}`);
+            if (cJson && cJson.data) content = cJson.data;
+            await delay(300); // Polite 0.3s wait to prevent proxy bans
+        } else {
+            console.log(`[${count}/${uniqueList.length}] Processing basic data for: ${item.slug}`);
         }
 
         const minP = content?.minPrice || item.minPrice || null;
@@ -102,12 +156,11 @@ async function runScraper() {
         message: "IPO details fetched successfully",
         count: finalRecords.length,
         data: finalRecords,
-        meta: { lastSyncedAt: new Date().toISOString(), version: "1.0.0-github-engine" }
+        meta: { lastSyncedAt: new Date().toISOString(), version: "2.0.0-proxy-engine" }
     };
 
-    // Save data to a file
     fs.writeFileSync('ipo-data.json', JSON.stringify(payload, null, 2));
-    console.log(`Successfully saved ${finalRecords.length} records.`);
+    console.log(`\n✅ Successfully generated and saved ${finalRecords.length} fully enriched records.`);
 }
 
 function parseIpoWatchHtml(html) {
