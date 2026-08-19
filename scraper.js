@@ -4,43 +4,48 @@ const UPSTOX_API = "https://service.upstox.com/nextgen-ipo/open/v1";
 const UPSTOX_CONTENT = "https://service.upstox.com/content/open/v2";
 const IPOWATCH_URL = "https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp/";
 
-// Helper to pause between requests so we don't trigger rate limits
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
+// Stealth Fetcher with 3 Rotating Proxies to prevent any blocks
 async function stealthFetchJson(targetUrl) {
-    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+    const proxies = [
+        targetUrl, // Try direct first
+        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+        `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(targetUrl)}`
+    ];
+
     const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)',
         'Accept': 'application/json',
         'Origin': 'https://upstox.com',
         'Referer': 'https://upstox.com/'
     };
 
-    try {
-        // Try direct first with stealth headers
-        let res = await fetch(targetUrl, { headers });
-        if (res.ok) return await res.json();
-        
-        // If blocked, use the proxy
-        res = await fetch(proxyUrl, { headers });
-        if (res.ok) return await res.json();
-    } catch (e) {
-        console.log(`Failed to fetch JSON: ${targetUrl}`);
+    for (let url of proxies) {
+        try {
+            let res = await fetch(url, { headers });
+            if (res.ok) {
+                let text = await res.text();
+                if (text.startsWith('<')) continue; // Skip if proxy returns HTML error page
+                return JSON.parse(text);
+            }
+        } catch (e) { }
     }
     return null;
 }
 
 async function stealthFetchHtml(targetUrl) {
-    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
-    const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
-    
-    try {
-        let res = await fetch(targetUrl, { headers });
-        if (res.ok) return await res.text();
-        
-        res = await fetch(proxyUrl, { headers });
-        if (res.ok) return await res.text();
-    } catch (e) {}
+    const proxies = [
+        targetUrl,
+        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+        `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(targetUrl)}`
+    ];
+    for (let url of proxies) {
+        try {
+            let res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            if (res.ok) return await res.text();
+        } catch (e) {}
+    }
     return "";
 }
 
@@ -49,18 +54,31 @@ async function runScraper() {
     const statuses = ["open", "upcoming", "closed", "listed"];
     let rawList = [];
 
-    // 1. Fetch Upstox Discovery via Proxies
+    // 1. Fetch Upstox Discovery
     for (const status of statuses) {
         console.log(`Discovering [${status.toUpperCase()}] IPOs...`);
         const json = await stealthFetchJson(`${UPSTOX_API}/ipos?status=${status}`);
-        if (json && json.data) {
-            rawList.push(...json.data.map(i => ({ ...i, _lifecycle: status.toUpperCase() })));
+        
+        let items = [];
+        // Crash-proof check: Handle both Arrays and Paginated Objects safely
+        if (json) {
+            if (Array.isArray(json.data)) items = json.data;
+            else if (json.data && Array.isArray(json.data.list)) items = json.data.list;
+            else if (json.data && Array.isArray(json.data.content)) items = json.data.content;
+            else if (Array.isArray(json)) items = json;
         }
-        await delay(500); // Polite 0.5s wait
+
+        if (items.length > 0) {
+            rawList.push(...items.map(i => ({ ...i, _lifecycle: status.toUpperCase() })));
+            console.log(`-> Successfully found ${items.length} records for ${status}`);
+        } else {
+            console.log(`-> No records found or structure changed for ${status}`);
+        }
+        await delay(500); // Polite delay
     }
 
     if (rawList.length === 0) {
-        console.error("CRITICAL ERROR: Proxies were blocked. Zero records fetched.");
+        console.error("CRITICAL ERROR: No records fetched. Proxies may be completely blocked.");
         return;
     }
 
@@ -70,15 +88,18 @@ async function runScraper() {
         if (item.slug && !uniqueMap.has(item.slug)) uniqueMap.set(item.slug, item);
     });
     const uniqueList = Array.from(uniqueMap.values());
-    console.log(`Discovered ${uniqueList.length} unique IPOs.`);
+    console.log(`\nDiscovered ${uniqueList.length} unique IPOs across all statuses.`);
 
     // 2. Fetch IPOWatch GMP
     console.log("Fetching GMP sentiment from IPOWatch...");
     let gmpIndex = [];
     const html = await stealthFetchHtml(IPOWATCH_URL);
-    if (html) gmpIndex = parseIpoWatchHtml(html);
+    if (html) {
+        gmpIndex = parseIpoWatchHtml(html);
+        console.log(`-> Found ${gmpIndex.length} GMP records`);
+    }
 
-    // 3. Process and Merge Deep Details (Safely throttled)
+    // 3. Process and Merge Deep Details
     const finalRecords = [];
     let count = 0;
 
@@ -87,14 +108,12 @@ async function runScraper() {
         let content = null;
         const status = item._lifecycle === "OPEN" ? "LIVE" : item._lifecycle;
 
-        // Fetch deep details (Dates, DRHP) for Active & Upcoming IPOs
+        // Only fetch deep DRHP/Pros/Cons for LIVE & UPCOMING to prevent hitting limits
         if (status === "LIVE" || status === "UPCOMING") {
             console.log(`[${count}/${uniqueList.length}] Fetching deep data for: ${item.slug}`);
             const cJson = await stealthFetchJson(`${UPSTOX_CONTENT}/ipo/slug/${item.slug}`);
             if (cJson && cJson.data) content = cJson.data;
-            await delay(300); // Polite 0.3s wait to prevent proxy bans
-        } else {
-            console.log(`[${count}/${uniqueList.length}] Processing basic data for: ${item.slug}`);
+            await delay(400); 
         }
 
         const minP = content?.minPrice || item.minPrice || null;
@@ -146,7 +165,6 @@ async function runScraper() {
         });
     }
 
-    // Sort order
     const rank = { LIVE: 1, UPCOMING: 2, CLOSED: 3, LISTED: 4 };
     finalRecords.sort((a, b) => (rank[a.status] || 9) - (rank[b.status] || 9));
 
@@ -156,11 +174,11 @@ async function runScraper() {
         message: "IPO details fetched successfully",
         count: finalRecords.length,
         data: finalRecords,
-        meta: { lastSyncedAt: new Date().toISOString(), version: "2.0.0-proxy-engine" }
+        meta: { lastSyncedAt: new Date().toISOString(), version: "4.0.0-crashproof" }
     };
 
     fs.writeFileSync('ipo-data.json', JSON.stringify(payload, null, 2));
-    console.log(`\n✅ Successfully generated and saved ${finalRecords.length} fully enriched records.`);
+    console.log(`\n✅ SUCCESS! Generated ${finalRecords.length} records to ipo-data.json.`);
 }
 
 function parseIpoWatchHtml(html) {
