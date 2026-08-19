@@ -1,0 +1,11 @@
+{
+  "status": "success",
+  "statusCode": 200,
+  "message": "IPO details fetched successfully",
+  "count": 0,
+  "data": [],
+  "meta": {
+    "lastSyncedAt": "2026-08-19T11:45:39.258Z",
+    "version": "1.0.0-github-engine"
+  }
+}
