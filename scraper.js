@@ -6,79 +6,56 @@ const IPOWATCH_URL = "https://ipowatch.in/ipo-grey-market-premium-latest-ipo-gmp
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
-// Stealth Fetcher with 3 Rotating Proxies to prevent any blocks
-async function stealthFetchJson(targetUrl) {
-    const proxies = [
-        targetUrl, // Try direct first
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-        `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(targetUrl)}`
-    ];
-
+async function fetchDirect(url, isJson = true) {
     const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)',
-        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
         'Origin': 'https://upstox.com',
         'Referer': 'https://upstox.com/'
     };
-
-    for (let url of proxies) {
-        try {
-            let res = await fetch(url, { headers });
-            if (res.ok) {
-                let text = await res.text();
-                if (text.startsWith('<')) continue; // Skip if proxy returns HTML error page
-                return JSON.parse(text);
-            }
-        } catch (e) { }
+    try {
+        const res = await fetch(url, { headers });
+        if (res.ok) {
+            return isJson ? await res.json() : await res.text();
+        }
+    } catch (e) {
+        console.error(`Fetch failed for ${url}:`, e.message);
     }
     return null;
 }
 
-async function stealthFetchHtml(targetUrl) {
-    const proxies = [
-        targetUrl,
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-        `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(targetUrl)}`
-    ];
-    for (let url of proxies) {
-        try {
-            let res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-            if (res.ok) return await res.text();
-        } catch (e) {}
-    }
-    return "";
-}
-
 async function runScraper() {
-    console.log("Starting Enterprise Stealth Scraper Engine...");
+    console.log("Starting GitHub Actions Direct Scraper Engine...");
     const statuses = ["open", "upcoming", "closed", "listed"];
     let rawList = [];
 
-    // 1. Fetch Upstox Discovery
+    // 1. Fetch Upstox Discovery (Direct from Azure, No Proxies Needed)
     for (const status of statuses) {
         console.log(`Discovering [${status.toUpperCase()}] IPOs...`);
-        const json = await stealthFetchJson(`${UPSTOX_API}/ipos?status=${status}`);
+        const json = await fetchDirect(`${UPSTOX_API}/ipos?status=${status}`, true);
         
         let items = [];
-        // Crash-proof check: Handle both Arrays and Paginated Objects safely
-        if (json) {
+        // CRASH-PROOF ARRAY EXTRACTION (Fixes the json.data.map error)
+        if (json && json.data) {
             if (Array.isArray(json.data)) items = json.data;
-            else if (json.data && Array.isArray(json.data.list)) items = json.data.list;
-            else if (json.data && Array.isArray(json.data.content)) items = json.data.content;
-            else if (Array.isArray(json)) items = json;
+            else if (Array.isArray(json.data.content)) items = json.data.content;
+            else if (Array.isArray(json.data.list)) items = json.data.list;
+            else if (Array.isArray(json.data.data)) items = json.data.data;
+        } else if (Array.isArray(json)) {
+            items = json;
         }
 
         if (items.length > 0) {
             rawList.push(...items.map(i => ({ ...i, _lifecycle: status.toUpperCase() })));
-            console.log(`-> Successfully found ${items.length} records for ${status}`);
+            console.log(`-> Found ${items.length} records for ${status}`);
         } else {
-            console.log(`-> No records found or structure changed for ${status}`);
+            console.log(`-> No records returned or format unknown for ${status}`);
         }
-        await delay(500); // Polite delay
+        await delay(500); // Polite delay to prevent rate limiting
     }
 
     if (rawList.length === 0) {
-        console.error("CRITICAL ERROR: No records fetched. Proxies may be completely blocked.");
+        console.error("CRITICAL ERROR: No records fetched at all.");
         return;
     }
 
@@ -88,18 +65,18 @@ async function runScraper() {
         if (item.slug && !uniqueMap.has(item.slug)) uniqueMap.set(item.slug, item);
     });
     const uniqueList = Array.from(uniqueMap.values());
-    console.log(`\nDiscovered ${uniqueList.length} unique IPOs across all statuses.`);
+    console.log(`\nTotal Unique IPOs to process: ${uniqueList.length}`);
 
-    // 2. Fetch IPOWatch GMP
-    console.log("Fetching GMP sentiment from IPOWatch...");
+    // 2. Fetch GMP Sentiment
+    console.log("Fetching GMP from IPOWatch...");
     let gmpIndex = [];
-    const html = await stealthFetchHtml(IPOWATCH_URL);
+    const html = await fetchDirect(IPOWATCH_URL, false);
     if (html) {
         gmpIndex = parseIpoWatchHtml(html);
         console.log(`-> Found ${gmpIndex.length} GMP records`);
     }
 
-    // 3. Process and Merge Deep Details
+    // 3. Enrich
     const finalRecords = [];
     let count = 0;
 
@@ -108,12 +85,14 @@ async function runScraper() {
         let content = null;
         const status = item._lifecycle === "OPEN" ? "LIVE" : item._lifecycle;
 
-        // Only fetch deep DRHP/Pros/Cons for LIVE & UPCOMING to prevent hitting limits
+        // Fetch deep details for LIVE & UPCOMING
         if (status === "LIVE" || status === "UPCOMING") {
-            console.log(`[${count}/${uniqueList.length}] Fetching deep data for: ${item.slug}`);
-            const cJson = await stealthFetchJson(`${UPSTOX_CONTENT}/ipo/slug/${item.slug}`);
+            console.log(`[${count}/${uniqueList.length}] Deep fetch for: ${item.slug}`);
+            const cJson = await fetchDirect(`${UPSTOX_CONTENT}/ipo/slug/${item.slug}`, true);
             if (cJson && cJson.data) content = cJson.data;
-            await delay(400); 
+            await delay(300);
+        } else {
+            if (count % 10 === 0) console.log(`[${count}/${uniqueList.length}] Processed historic IPOs...`);
         }
 
         const minP = content?.minPrice || item.minPrice || null;
@@ -142,9 +121,9 @@ async function runScraper() {
                 lockInEndDateAnchorRemaining: item.anchorLockInRemaining || null
             },
             issueSize: {
-                totalIssueSize: item.issueSize ? String(item.issueSize) + " Cr" : null,
-                freshIssue: item.freshIssueSize ? String(item.freshIssueSize) + " Cr" : null,
-                offerForSale: item.ofsIssueSize ? String(item.ofsIssueSize) + " Cr" : null
+                totalIssueSize: item.issueSize ? String(item.issueSize).replace(/cr/i, "").trim() + " Cr" : null,
+                freshIssue: item.freshIssueSize ? String(item.freshIssueSize).replace(/cr/i, "").trim() + " Cr" : null,
+                offerForSale: item.ofsIssueSize ? String(item.ofsIssueSize).replace(/cr/i, "").trim() + " Cr" : null
             },
             aboutCompany: content?.description || item.description || null,
             drhpLink: content?.drhpUrl || item.drhpUrl || null,
@@ -165,6 +144,7 @@ async function runScraper() {
         });
     }
 
+    // Sort order
     const rank = { LIVE: 1, UPCOMING: 2, CLOSED: 3, LISTED: 4 };
     finalRecords.sort((a, b) => (rank[a.status] || 9) - (rank[b.status] || 9));
 
@@ -174,11 +154,11 @@ async function runScraper() {
         message: "IPO details fetched successfully",
         count: finalRecords.length,
         data: finalRecords,
-        meta: { lastSyncedAt: new Date().toISOString(), version: "4.0.0-crashproof" }
+        meta: { lastSyncedAt: new Date().toISOString(), version: "5.0.0-final-azure" }
     };
 
     fs.writeFileSync('ipo-data.json', JSON.stringify(payload, null, 2));
-    console.log(`\n✅ SUCCESS! Generated ${finalRecords.length} records to ipo-data.json.`);
+    console.log(`\n✅ SUCCESS! Saved ${finalRecords.length} fully enriched records.`);
 }
 
 function parseIpoWatchHtml(html) {
